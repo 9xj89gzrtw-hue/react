@@ -492,6 +492,40 @@ describe('ReactFlightDOMEdge', () => {
     expect(result.settings).toEqual(settings);
   });
 
+  it('binds a server reference to its containing array after the module loads', async () => {
+    let resolveModule;
+    const {read} = serverExports(
+      {
+        read(array, other) {
+          return [array.length, array[1].length, other];
+        },
+      },
+      new Promise(resolve => (resolveModule = resolve)),
+    );
+    const array = [];
+    array.push(read.bind(null, array, null), array);
+    const stream = await serverAct(() =>
+      ReactServerDOMServer.renderToReadableStream(array, webpackMap),
+    );
+    const response = ReactServerDOMClient.createFromReadableStream(stream, {
+      serverConsumerManifest: {
+        moduleMap: null,
+        serverModuleMap: webpackServerMap,
+        moduleLoading: null,
+      },
+    });
+    const observed = [];
+    await serverAct(() => {
+      response.then(value => {
+        observed.push(value[0]());
+      });
+    });
+    expect(observed).toEqual([]);
+
+    await serverAct(() => resolveModule());
+    expect(observed).toEqual([[2, 2, null]]);
+  });
+
   it('rejects a later Promise of an object holding a Map whose entry failed to load', async () => {
     let rejectLoad;
     const {value: failing} = clientExports(
