@@ -2585,9 +2585,7 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
         roots: {entry: 'holder', other: 'holder'},
       }));
 
-    // Reader bug.
-    // eslint-disable-next-line jest/no-disabled-tests
-    it.skip('Blob beside a cycle', () =>
+    it('Blob beside a cycle', () =>
       runGraph({
         nodes: {
           ready: {module: 'export-0'},
