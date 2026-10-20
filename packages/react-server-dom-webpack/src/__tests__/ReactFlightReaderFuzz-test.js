@@ -2356,9 +2356,7 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
   // fails today; the comment above it says whether the reader or the writer
   // is at fault.
   describe('known cases', () => {
-    // Reader bug.
-    // eslint-disable-next-line jest/no-disabled-tests
-    it.skip('Set containing itself', () =>
+    it('Set containing itself', () =>
       runGraph({
         nodes: {
           ready: {module: 'export-0'},
@@ -2367,9 +2365,7 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
         roots: {entry: 'set', other: 'set'},
       }));
 
-    // Reader bug.
-    // eslint-disable-next-line jest/no-disabled-tests
-    it.skip('Map containing itself', () =>
+    it('Map containing itself', () =>
       runGraph({
         nodes: {
           ready: {module: 'export-0'},
@@ -2384,9 +2380,7 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
         roots: {entry: 'map', other: 'map'},
       }));
 
-    // Reader bug.
-    // eslint-disable-next-line jest/no-disabled-tests
-    it.skip('two collections containing each other', () =>
+    it('two collections containing each other', () =>
       runGraph({
         nodes: {
           ready: {module: 'export-0'},
@@ -2607,9 +2601,7 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
   });
 
   describe('known cases with elements, components or Errors', () => {
-    // Reader bug.
-    // eslint-disable-next-line jest/no-disabled-tests
-    it.skip('props object referenced again while a prop is loading', () =>
+    it('props object referenced again while a prop is loading', () =>
       runGraph({
         nodes: {
           payload: {module: 'export-0'},
@@ -2633,9 +2625,7 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
         roots: {entry: 'element', other: 'selected'},
       }));
 
-    // Reader bug.
-    // eslint-disable-next-line jest/no-disabled-tests
-    it.skip('element reaching itself through its props', () =>
+    it('element reaching itself through its props', () =>
       runGraph({
         nodes: {
           payload: {module: 'export-0'},
@@ -2754,9 +2744,7 @@ describe.each(['node', 'edge'])('ReactFlightReaderFuzz (%s)', host => {
         roots: {entry: 'holder', other: 'holder'},
       }));
 
-    // Reader bug.
-    // eslint-disable-next-line jest/no-disabled-tests
-    it.skip('Error with cyclic cause', () =>
+    it('Error with cyclic cause', () =>
       runGraph({
         nodes: {
           ready: {module: 'export-0'},
