@@ -2013,6 +2013,27 @@ function subscribeToPendingContents(
         object.forEach((entry: any) => todo.push(entry));
       } else if (object instanceof Map) {
         object.forEach((entry: any, key: any) => todo.push(key, entry));
+      } else if (__DEV__ && object instanceof Error) {
+        // In DEV an Error carries its cause and errors, which are revived
+        // into it like fields of an object.
+        const errorFields = pendingFields.get(object);
+        if (errorFields !== undefined) {
+          errorFields.forEach(field => {
+            if (field.status === FIELD_FAILED) {
+              throw field.value;
+            }
+            if (field.status === FIELD_PENDING) {
+              subscribeToField(field, reference, handler, failureOnly);
+              count++;
+            }
+          });
+        }
+        if (!isPendingSlot(errorFields, 'cause')) {
+          todo.push((object as any).cause);
+        }
+        if (!isPendingSlot(errorFields, 'errors')) {
+          todo.push((object as any).errors);
+        }
       }
       continue;
     }
@@ -4871,33 +4892,8 @@ function resolveErrorDev(
   }
 
   let error;
-  const errorOptions =
-    // We don't serialize Error.cause in prod so we never need to deserialize
-    // $FlowFixMe[constant-condition]
-    __DEV__ && 'cause' in errorInfo
-      ? {
-          cause: reviveModel(
-            response,
-            // $FlowFixMe[incompatible-type] -- Flow thinks `cause` in `cause?: JSONValue` can be undefined after `in` check.
-            errorInfo.cause as JSONValue,
-            errorInfo,
-            'cause',
-          ),
-        }
-      : undefined;
   const isAggregateError =
     typeof AggregateError !== 'undefined' && 'errors' in errorInfo;
-  const revivedErrors =
-    // We don't serialize AggregateError.errors in prod so we never need to deserialize
-    __DEV__ && isAggregateError
-      ? reviveModel(
-          response,
-          // $FlowFixMe[incompatible-type]
-          errorInfo.errors as JSONValue,
-          errorInfo,
-          'errors',
-        )
-      : null;
   const callStack = buildFakeCallStack(
     response,
     stack,
@@ -4907,17 +4903,15 @@ function resolveErrorDev(
       ? // $FlowFixMe[incompatible-use]
         AggregateError.bind(
           null,
-          revivedErrors,
+          [],
           message ||
             'An error occurred in the Server Components render but no message was provided',
-          errorOptions,
         )
       : // $FlowFixMe[incompatible-use]
         Error.bind(
           null,
           message ||
             'An error occurred in the Server Components render but no message was provided',
-          errorOptions,
         ),
   );
 
@@ -4945,6 +4939,34 @@ function resolveErrorDev(
 
   (error as any).name = name;
   (error as any).environmentName = env;
+  // The cause and errors are revived into the Error itself so that a
+  // reference among them that is still pending fills the Error in when it
+  // resolves. We don't serialize them in prod so we never need to
+  // deserialize them there.
+  if ('cause' in errorInfo) {
+    Object.defineProperty(error, 'cause', {
+      configurable: true,
+      enumerable: false,
+      writable: true,
+      value: undefined,
+    });
+    (error as any).cause = reviveModel(
+      response,
+      // $FlowFixMe[incompatible-type] -- Flow thinks `cause` in `cause?: JSONValue` can be undefined after `in` check.
+      errorInfo.cause as JSONValue,
+      error,
+      'cause',
+    );
+  }
+  if (isAggregateError) {
+    (error as any).errors = reviveModel(
+      response,
+      // $FlowFixMe[incompatible-type]
+      errorInfo.errors as JSONValue,
+      error,
+      'errors',
+    );
+  }
   return error;
 }
 
