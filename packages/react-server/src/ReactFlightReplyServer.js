@@ -233,6 +233,9 @@ export type Response = {
   _pendingFields: WeakMap<Object, Map<string, InitializationReference>>,
   // Reserved Sets and Maps whose entries have not been copied in yet.
   _pendingCollections: WeakMap<Object, InitializationReference>,
+  // The handler tracking the completion of a value that was selected out of
+  // a model that has not completed, by the value.
+  _completions: WeakMap<Object, InitializationHandler>,
   // Inputs retained by values that hide them from property traversal: the
   // array behind an iterator and the arguments of a bound Server Function.
   _captures: WeakMap<Object, Array<any>>,
@@ -679,7 +682,7 @@ function resolveBoundArguments(
   reference.pendingInputs = 0;
   try {
     subscribeToInputSlots(response, reference, args);
-    subscribeToPendingContents(response, args, reference, true);
+    failWithContents(response, args, reference);
   } catch (error) {
     rejectInitializationReference(response, reference, error);
     return;
@@ -909,15 +912,11 @@ type InitializationReference = {
   listeners: null | Array<InitializationReference>,
   // Handlers whose chunk reaches this field.
   waiters: null | Array<InitializationHandler>,
-  // Constructors whose inputs reach this field. They do not wait for it, but
-  // they fail with it.
-  failureListeners: null | Array<InitializationReference>,
   // Non-null while a constructor waits for its inputs. Constructors read
   // their inputs when they run, so they wait for every input slot to be
   // installed.
   inputs: null | Object,
   pendingInputs: number,
-  seen: null | Set<Object>,
   // A Set or Map is allocated before its entries arrive so that references
   // to it, including from its own entries, find the final identity.
   collection: null | Set<any> | Map<any, any>,
@@ -936,7 +935,14 @@ type InitializationHandler = {
   deps: number,
   errored: boolean,
   // Objects already examined for pending fields on behalf of this handler.
+  // Only the handler tracking a selected value's completion walks.
   seen: null | Set<Object>,
+  // For the handler that tracks the completion of a value selected out of an
+  // incomplete model: the handlers of the models that selected it, which each
+  // hold one dependency on it, and constructors whose inputs reach the value,
+  // which fail with it but do not wait for it. Null for the handler of a chunk.
+  listeners: null | Array<InitializationHandler>,
+  failureListeners: null | Array<InitializationReference>,
 };
 // The parsed value of a chunk that is BLOCKED or ERRORED because references
 // inside it are still outstanding or failed, with the array context it was
@@ -963,6 +969,8 @@ function createInitializationHandler(deps: number): InitializationHandler {
     deps,
     errored: false,
     seen: null,
+    listeners: null,
+    failureListeners: null,
   };
 }
 
@@ -1227,6 +1235,17 @@ function initializeChunkIfUnblocked(
   }
   const chunk = handler.chunk;
   if (chunk === null) {
+    const listeners = handler.listeners;
+    if (listeners !== null) {
+      // The value this handler tracks is complete.
+      handler.listeners = null;
+      handler.failureListeners = null;
+      for (let i = 0; i < listeners.length; i++) {
+        const listener = listeners[i];
+        listener.deps--;
+        initializeChunkIfUnblocked(response, listener);
+      }
+    }
     return;
   }
   // `BlockedChunk` is the chunk's type at the time the handler recorded it.
@@ -1330,16 +1349,9 @@ function subscribeToField(
   field: InitializationReference,
   reference: null | InitializationReference,
   handler: null | InitializationHandler,
-  failureOnly: boolean,
 ): void {
   if (reference !== null) {
-    if (failureOnly) {
-      if (field.failureListeners === null) {
-        field.failureListeners = [reference];
-      } else {
-        field.failureListeners.push(reference);
-      }
-    } else if (field.listeners === null) {
+    if (field.listeners === null) {
       field.listeners = [reference];
     } else {
       field.listeners.push(reference);
@@ -1354,22 +1366,91 @@ function subscribeToField(
   }
 }
 
-// Subscribes `waiter` to every pending field reachable from `value` through
+// The handler that tracks the completion of `value`, which was selected out
+// of a model that has not completed: it walks the value's contents once and
+// waits for every pending field it reaches, and the models that selected the
+// value take one dependency on it, so that a value shared by many models is
+// walked once rather than once per model. Throws the error of a pending field
+// the walk reaches that already failed.
+function getCompletion(
+  response: Response,
+  value: Object,
+): InitializationHandler {
+  let tracker = response._completions.get(value);
+  if (tracker === undefined) {
+    tracker = createInitializationHandler(0);
+    tracker.listeners = [];
+    tracker.failureListeners = [];
+    response._completions.set(value, tracker);
+    try {
+      tracker.deps = subscribeToPendingContents(response, value, tracker);
+    } catch (error) {
+      tracker.errored = true;
+      tracker.reason = error;
+      tracker.listeners = null;
+      tracker.failureListeners = null;
+    }
+  }
+  if (tracker.errored) {
+    throw tracker.reason;
+  }
+  return tracker;
+}
+
+// Makes `handler` wait for everything reachable from `value` to be installed.
+// Returns the number of dependencies added.
+function waitForContents(
+  response: Response,
+  value: any,
+  handler: InitializationHandler,
+): number {
+  if (
+    (typeof value !== 'object' && typeof value !== 'function') ||
+    value === null
+  ) {
+    return 0;
+  }
+  const tracker = getCompletion(response, value);
+  if (tracker.deps === 0) {
+    return 0;
+  }
+  // $FlowFixMe[incompatible-use]: A tracker that is not errored has listeners.
+  tracker.listeners.push(handler);
+  return 1;
+}
+
+// Fails `reference` as soon as anything reachable from `value` fails, without
+// waiting for it: a collection can contain itself.
+function failWithContents(
+  response: Response,
+  value: any,
+  reference: InitializationReference,
+): void {
+  if (
+    (typeof value !== 'object' && typeof value !== 'function') ||
+    value === null
+  ) {
+    return;
+  }
+  const tracker = getCompletion(response, value);
+  if (tracker.deps === 0) {
+    return;
+  }
+  // $FlowFixMe[incompatible-use]: A tracker that is not errored has listeners.
+  tracker.failureListeners.push(reference);
+}
+
+// Subscribes `handler` to every pending field reachable from `value` through
 // ordinary contents and returns how many there are. Promises are separate
 // delivery boundaries, and server module exports are never read into. Each
-// object is examined once per waiter: a field installed later is walked when
+// object is examined once per handler: a field installed later is walked when
 // it is installed, so a cycle adds no work and a shared object is not counted
 // twice. A pending field reached here that already failed throws its error.
 function subscribeToPendingContents(
   response: Response,
   value: any,
-  waiter: InitializationReference | InitializationHandler,
-  failureOnly: boolean,
+  handler: InitializationHandler,
 ): number {
-  const handler: null | InitializationHandler =
-    (waiter as any).parentObject === undefined ? (waiter as any) : null;
-  const reference: null | InitializationReference =
-    handler === null ? (waiter as any) : null;
   if (
     (typeof value !== 'object' && typeof value !== 'function') ||
     value === null
@@ -1377,10 +1458,10 @@ function subscribeToPendingContents(
     return 0;
   }
   let seen: Set<Object>;
-  if (waiter.seen === null) {
-    seen = waiter.seen = new Set();
+  if (handler.seen === null) {
+    seen = handler.seen = new Set();
   } else {
-    seen = waiter.seen;
+    seen = handler.seen;
   }
   const pendingFields = response._pendingFields;
   const pendingCollections = response._pendingCollections;
@@ -1406,7 +1487,7 @@ function subscribeToPendingContents(
           throw collection.value;
         }
         // Its entries are not copied in yet. They are walked when they are.
-        subscribeToField(collection, reference, handler, failureOnly);
+        subscribeToField(collection, null, handler);
         count++;
         continue;
       }
@@ -1431,7 +1512,7 @@ function subscribeToPendingContents(
           throw field.value;
         }
         if (field.status === FIELD_PENDING) {
-          subscribeToField(field, reference, handler, failureOnly);
+          subscribeToField(field, null, handler);
           count++;
         }
       });
@@ -1498,10 +1579,8 @@ function rejectInitializationReference(
   // placeholder or an empty collection.
   const listeners = reference.listeners;
   const waiters = reference.waiters;
-  const failureListeners = reference.failureListeners;
   reference.listeners = null;
   reference.waiters = null;
-  reference.failureListeners = null;
   if (waiters !== null) {
     for (let i = 0; i < waiters.length; i++) {
       rejectReference(response, waiters[i], error);
@@ -1510,11 +1589,6 @@ function rejectInitializationReference(
   if (listeners !== null) {
     for (let i = 0; i < listeners.length; i++) {
       rejectInitializationReference(response, listeners[i], error);
-    }
-  }
-  if (failureListeners !== null) {
-    for (let i = 0; i < failureListeners.length; i++) {
-      rejectInitializationReference(response, failureListeners[i], error);
     }
   }
   rejectReference(response, reference.handler, error);
@@ -1559,7 +1633,7 @@ function fulfillReference(
             // Continue from the field's value once it is installed. The
             // listener receives that value, so the path up to it is dropped.
             path.splice(0, i);
-            subscribeToField(field, reference, null, false);
+            subscribeToField(field, reference, null);
             return;
           }
           // A reserved collection: its identity is the field's value.
@@ -1649,12 +1723,7 @@ function installReference(
   const complete = source === null || source.status === INITIALIZED;
   if (!complete) {
     try {
-      handler.deps += subscribeToPendingContents(
-        response,
-        contents,
-        handler,
-        false,
-      );
+      handler.deps += waitForContents(response, contents, handler);
     } catch (error) {
       rejectReference(response, handler, error);
     }
@@ -1668,12 +1737,7 @@ function installReference(
       const waiter = waiters[i];
       if (!complete) {
         try {
-          waiter.deps += subscribeToPendingContents(
-            response,
-            contents,
-            waiter,
-            false,
-          );
+          waiter.deps += subscribeToPendingContents(response, contents, waiter);
         } catch (error) {
           rejectReference(response, waiter, error);
           continue;
@@ -1681,18 +1745,6 @@ function installReference(
       }
       waiter.deps--;
       initializeChunkIfUnblocked(response, waiter);
-    }
-  }
-  const failureListeners = reference.failureListeners;
-  reference.failureListeners = null;
-  if (failureListeners !== null && !complete) {
-    for (let i = 0; i < failureListeners.length; i++) {
-      const listener = failureListeners[i];
-      try {
-        subscribeToPendingContents(response, contents, listener, true);
-      } catch (error) {
-        rejectInitializationReference(response, listener, error);
-      }
     }
   }
   if (listeners !== null) {
@@ -1742,7 +1794,7 @@ function waitForInputs(
     }
     // Deeper contents are not waited for, since a collection can contain
     // itself, but a failure among them fails this value as soon as it happens.
-    subscribeToPendingContents(response, inputs, reference, true);
+    failWithContents(response, inputs, reference);
   }
   if (reference.pendingInputs === 0) {
     runMapping(response, reference, inputs);
@@ -1768,7 +1820,7 @@ function subscribeToInputSlots(
     // A reserved collection's identity is installed; that is what the
     // constructor copies. Its entries are tracked separately.
     if (field.status === FIELD_PENDING && field.collection === null) {
-      subscribeToField(field, reference, null, false);
+      subscribeToField(field, reference, null);
       reference.pendingInputs++;
     }
   });
@@ -1863,7 +1915,24 @@ function rejectReference(
   handler.value = null;
   handler.reason = error;
   const chunk = handler.chunk;
-  if (chunk === null || chunk.status !== BLOCKED) {
+  if (chunk === null) {
+    const listeners = handler.listeners;
+    const failureListeners = handler.failureListeners;
+    handler.listeners = null;
+    handler.failureListeners = null;
+    if (listeners !== null) {
+      for (let i = 0; i < listeners.length; i++) {
+        rejectReference(response, listeners[i], error);
+      }
+    }
+    if (failureListeners !== null) {
+      for (let i = 0; i < failureListeners.length; i++) {
+        rejectInitializationReference(response, failureListeners[i], error);
+      }
+    }
+    return;
+  }
+  if (chunk.status !== BLOCKED) {
     return;
   }
   // There's no debug info to forward in this direction.
@@ -1977,10 +2046,8 @@ function createReference<T>(
     value: null,
     listeners: null,
     waiters: null,
-    failureListeners: null,
     inputs: null,
     pendingInputs: 0,
-    seen: null,
     collection: null,
     binding: null,
   };
@@ -2042,10 +2109,8 @@ function recordFailedField(
     value: error,
     listeners: null,
     waiters: null,
-    failureListeners: null,
     inputs: null,
     pendingInputs: 0,
-    seen: null,
     collection: null,
     binding: null,
   };
@@ -2155,7 +2220,7 @@ function getOutlinedModel<T>(
             referenceArrayRoot,
             source,
           );
-          subscribeToField(field, fieldReference, null, false);
+          subscribeToField(field, fieldReference, null);
           return getReferencePlaceholder(fieldReference);
         }
         // A reserved collection: its identity is the field's value.
@@ -2199,12 +2264,7 @@ function getOutlinedModel<T>(
       handler = initializingHandler = createInitializationHandler(0);
     }
     try {
-      handler.deps += subscribeToPendingContents(
-        response,
-        value,
-        handler,
-        false,
-      );
+      handler.deps += waitForContents(response, value, handler);
     } catch (error) {
       recordFailedField(response, parentObject, key, error);
       markHandlerErrored(error);
@@ -3004,6 +3064,7 @@ export function createResponse(
     _identities: new WeakMap(),
     _pendingFields: new WeakMap(),
     _pendingCollections: new WeakMap(),
+    _completions: new WeakMap(),
     _captures: new WeakMap(),
   };
   return response;
